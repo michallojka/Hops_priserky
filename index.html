@@ -1,0 +1,495 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Zachraňte Hopsáky – Hopsárium</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@600;700&display=swap" rel="stylesheet">
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;touch-action:none;
+    user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;cursor:crosshair}
+  canvas{display:block;width:100vw;height:100vh;touch-action:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =========================================================
+   INVAZE PŘÍŠEREK – kooperativní hra pro interaktivní stěnu
+   Ovládání: dotyk / zásah míčkem = kliknutí (multitouch).
+   Klávesy (jen pro obsluhu): F = celá obrazovka, D = ladění
+   ========================================================= */
+
+/* ---------- NASTAVENÍ (lze upravit) ---------- */
+const CONFIG = {
+  roundSeconds: 150,      // délka hry v sekundách
+  bossAt: 40,             // kolik sekund před koncem přiletí boss
+  lives: 10,              // společné životy skupiny
+  bossHp: 80,             // kolik zásahů boss vydrží
+  hitScale: 1.3,          // tolerance zásahu (1 = přesně obrys příšerky)
+  debounceMs: 150,        // ignorovat další zásah na stejném místě (odskok míčku)
+  debounceDist: 0.05,     // ... v okruhu (podíl výšky stěny)
+  endScreenSeconds: 15,   // jak dlouho svítí výsledky, pak úvodní obrazovka
+  sound: true,
+  // Grafika Hopsária – stačí nahrát soubory do složky img/ se stejnými názvy.
+  // Chybějící obrázek se nahradí kreslenou příšerkou.
+  images: {
+    background: 'img/pozadi.jpg',
+    logo: 'img/logo.png',
+    // postavičky podle velikosti (malé = rychlé, velké = 3 zásahy)
+    small:  [1, 2, 3, 4, 5, 6].map(n => 'img/maly' + n + '.png'),
+    normal: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].map(n => 'img/stredni' + n + '.png'),
+    big:    [1, 2, 3, 4, 5].map(n => 'img/velky' + n + '.png'),
+    boss: 'img/pirat.png'
+  }
+};
+
+/* ---------- PLÁTNO ---------- */
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+let W, H, U, DPR;
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = innerWidth; H = innerHeight; U = H / 100;   // 1 U = 1 % výšky stěny (~3 cm)
+  cv.width = W * DPR; cv.height = H * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+}
+addEventListener('resize', resize); resize();
+
+/* ---------- OBRÁZKY ---------- */
+const IMG = {};
+function loadImg(key, src) { const i = new Image(); i.onload = () => IMG[key] = i; i.src = src; }
+loadImg('bg', CONFIG.images.background);
+loadImg('logo', CONFIG.images.logo);
+loadImg('boss', CONFIG.images.boss);
+['small', 'normal', 'big'].forEach(t => CONFIG.images[t].forEach((s, i) => loadImg(t + i, s)));
+
+/* ---------- ZVUKY (generované, bez souborů) ---------- */
+let AC = null;
+function audioInit() {
+  if (!CONFIG.sound) return;
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function tone(f1, f2, dur, type = 'sine', vol = .2, delay = 0) {
+  if (!AC) return;
+  const t = AC.currentTime + delay, o = AC.createOscillator(), g = AC.createGain();
+  o.type = type; o.frequency.setValueAtTime(f1, t); o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+  g.gain.setValueAtTime(vol, t); g.gain.exponentialRampToValueAtTime(.001, t + dur);
+  o.connect(g).connect(AC.destination); o.start(t); o.stop(t + dur + .02);
+}
+let lastPop = 0;
+const SFX = {
+  pop() { const n = performance.now(); if (n - lastPop < 40) return; lastPop = n; tone(500 + Math.random() * 300, 1400, .12, 'square', .07); },
+  hit() { tone(320, 200, .08, 'square', .05); },
+  hurt() { tone(220, 60, .4, 'sawtooth', .15); },
+  boss() { tone(140, 40, .9, 'sawtooth', .22); },
+  win() { [523, 659, 784, 1047, 1319].forEach((f, i) => tone(f, f, .3, 'triangle', .2, i * .14)); },
+  lose() { [440, 349, 262].forEach((f, i) => tone(f, f * .95, .35, 'triangle', .2, i * .22)); },
+  beep(f) { tone(f, f, .18, 'sine', .22); }
+};
+
+/* ---------- STAV HRY ---------- */
+const PAL = ['#ff5aa5', '#ffb627', '#3ddc84', '#4cc9f0', '#b388ff', '#ff7b54'];
+let state = 'attract', stateT = 0;
+let score, lives, timeLeft, elapsed, spawnT, boss, bossSpawned, result, newRecord;
+let monsters = [], parts = [], pops = [], ripples = [], recent = [], decor = [];
+let shake = 0, debug = false, lastBonus = 0;
+const today = () => new Date().toDateString();
+let best = 0;
+try { const d = JSON.parse(localStorage.getItem('invaze_best') || '{}'); if (d.day === today()) best = d.score || 0; } catch (e) {}
+
+function setState(s) { state = s; stateT = 0; }
+
+function startGame() {
+  score = 0; lives = CONFIG.lives; timeLeft = CONFIG.roundSeconds; elapsed = 0;
+  spawnT = 0; boss = null; bossSpawned = false; monsters = []; newRecord = false; lastBonus = 0;
+  setState('countdown');
+}
+
+function progress() { return Math.min(1, elapsed / (CONFIG.roundSeconds - CONFIG.bossAt)); }
+
+const TYPES = {
+  small:  { r: 6,  sp: 1.6,  hp: 1, pts: 15, eyes: 1 },
+  normal: { r: 8.5, sp: 1,   hp: 1, pts: 10, eyes: 2 },
+  big:    { r: 12, sp: .65,  hp: 3, pts: 30, eyes: 3 }
+};
+
+function spawnMonster(opts = {}) {
+  const p = progress(), roll = Math.random();
+  const type = opts.type || (roll < .2 + .15 * p ? 'small' : roll < .85 ? 'normal' : 'big');
+  const d = TYPES[type], r = d.r * U, base = (8 + 12 * p) * U * d.sp;
+  const m = { type, r, hp: d.hp, maxHp: d.hp, pts: d.pts, eyes: d.eyes, phase: Math.random() * 6.3,
+    flash: 0, dx: 0, variant: Math.floor(Math.random() * CONFIG.images[type].length), spin: 0,
+    color: PAL[Math.floor(Math.random() * PAL.length)], wob: (2 + Math.random() * 5) * U };
+  if (opts.x != null) {                       // vypuštěná bossem
+    m.x = opts.x; m.y = opts.y; m.vx = (Math.random() - .5) * 30 * U; m.vy = base;
+  } else if (Math.random() < .25) {           // přilétá z boku
+    const left = Math.random() < .5;
+    m.x = left ? -r : W + r; m.y = (10 + Math.random() * 35) * U;
+    m.vx = (left ? 1 : -1) * (10 + 8 * p) * U; m.vy = base * .5;
+  } else {                                    // padá shora
+    m.x = r + Math.random() * (W - 2 * r); m.y = -r; m.vx = 0; m.vy = base;
+  }
+  monsters.push(m);
+}
+
+function spawnBoss() {
+  bossSpawned = true;
+  boss = { x: W / 2, y: -25 * U, r: 20 * U, hp: CONFIG.bossHp, maxHp: CONFIG.bossHp,
+    flash: 0, phase: 0, targetY: 33 * U, dropT: 3 };
+  SFX.boss(); shake = 1.2 * U;
+  pops.push({ x: W / 2, y: 55 * U, text: 'PIRÁT! VŠICHNI NA NĚJ!', life: 2.5, size: 9 * U, color: '#ffe14d' });
+}
+
+/* ---------- ZÁSAHY ---------- */
+function onHit(x, y) {
+  const now = performance.now();
+  recent = recent.filter(h => now - h.t < CONFIG.debounceMs);
+  const dd = CONFIG.debounceDist * H;
+  if (recent.some(h => Math.hypot(h.x - x, h.y - y) < dd)) return;   // odskok míčku
+  recent.push({ x, y, t: now });
+  ripples.push({ x, y, life: 1 });
+
+  if (state === 'attract') { startGame(); SFX.beep(660); return; }
+  if (state === 'end') { if (stateT > 4) { startGame(); SFX.beep(660); } return; }
+  if (state !== 'play') return;
+
+  // nejbližší cíl (vzdálenost poměrně k velikosti)
+  let target = null, bestD = 1e9;
+  for (const m of monsters) {
+    const d = Math.hypot(m.x + m.dx - x, m.y - y) / m.r;
+    if (d < CONFIG.hitScale && d < bestD) { bestD = d; target = m; }
+  }
+  if (boss && boss.hp > 0) {
+    const d = Math.hypot(boss.x - x, boss.y - y) / boss.r;
+    if (d < 1.15 && d < bestD) { hitBoss(x, y); return; }
+  }
+  if (target) {
+    target.hp--; target.flash = .15;
+    if (target.hp <= 0) kill(target); else { SFX.hit(); burst(x, y, target.color, 6); }
+  }
+}
+
+let rescued = [];
+function kill(m) {
+  monsters.splice(monsters.indexOf(m), 1);
+  rescued.push({ ...m, x: m.x + m.dx, dx: 0, vx: (Math.random() - .5) * 40 * U, vy: -55 * U, life: 1, flash: 0 });
+  score += m.pts;
+  burst(m.x + m.dx, m.y, '#ffe14d', 14);
+  pops.push({ x: m.x + m.dx, y: m.y, text: '+' + m.pts, life: 1, size: 6 * U, color: '#fff' });
+  SFX.pop();
+}
+
+function hitBoss(x, y) {
+  boss.hp--; boss.flash = .12; score += 5;
+  burst(x, y, '#ffb627', 8);
+  pops.push({ x, y, text: '+5', life: .7, size: 4.5 * U, color: '#ffe14d' });
+  SFX.hit();
+  if (boss.hp <= 0) {
+    const bonus = 500 + Math.ceil(timeLeft) * 10;
+    score += bonus;
+    for (let i = 0; i < 6; i++) burst(boss.x + (Math.random() - .5) * boss.r * 2, boss.y + (Math.random() - .5) * boss.r * 2, PAL[i], 25);
+    lastBonus = bonus;
+    shake = 2 * U;
+    endGame('win');
+  }
+}
+
+function burst(x, y, color, n) {
+  for (let i = 0; i < n; i++) {
+    const a = Math.random() * 6.3, s = (15 + Math.random() * 45) * U;
+    parts.push({ x, y, vx: Math.cos(a) * s, vy: Math.sin(a) * s - 15 * U, life: 1, r: (.6 + Math.random() * 1.4) * U, color });
+  }
+}
+
+function endGame(res) {
+  result = res;
+  for (const m of monsters) burst(m.x + m.dx, m.y, m.color, 8);
+  monsters = [];
+  if (res !== 'win' && boss) boss.flee = true;
+  if (score > best) {
+    best = score; newRecord = score > 0;
+    try { localStorage.setItem('invaze_best', JSON.stringify({ day: today(), score: best })); } catch (e) {}
+  }
+  res === 'win' ? SFX.win() : SFX.lose();
+  setState('end');
+}
+
+/* ---------- AKTUALIZACE ---------- */
+function updatePlay(dt) {
+  elapsed += dt; timeLeft -= dt;
+  const p = progress();
+
+  if (!bossSpawned && timeLeft <= CONFIG.bossAt) spawnBoss();
+
+  spawnT -= dt;
+  if (spawnT <= 0 && monsters.length < 45) {
+    spawnMonster();
+    let interval = (1.2 - .8 * p) / Math.max(1, W / H / 1.5);   // širší stěna = víc příšerek
+    if (boss) interval *= 2.2;
+    spawnT = interval * (.7 + Math.random() * .6);
+  }
+
+  if (boss) {
+    const angry = boss.hp < boss.maxHp * .3;
+    if (boss.y < boss.targetY && boss.phase === 0) boss.y += 18 * U * dt;
+    else {
+      boss.phase += dt * (angry ? 1 : .6);
+      boss.x = W / 2 + Math.sin(boss.phase) * (W / 2 - boss.r - 5 * U);
+      boss.y = boss.targetY + Math.sin(boss.phase * 2.3) * 6 * U;
+    }
+    boss.dropT -= dt;
+    if (boss.dropT <= 0) { spawnMonster({ type: 'small', x: boss.x, y: boss.y + boss.r * .6 }); boss.dropT = angry ? 1.4 : 2.4; }
+  }
+
+  for (let i = monsters.length - 1; i >= 0; i--) {
+    const m = monsters[i];
+    m.phase += dt * 3;
+    m.x += m.vx * dt; m.y += m.vy * dt;
+    m.dx = m.vx === 0 ? Math.sin(m.phase * .7) * m.wob : 0;
+    if (m.x < m.r && m.vx < 0) m.vx *= -1;
+    if (m.x > W - m.r && m.vx > 0) m.vx *= -1;
+    if (m.y > H - 3 * U) {                     // dopadla dolů
+      monsters.splice(i, 1); lives--;
+      burst(m.x + m.dx, H - 2 * U, '#7fdcff', 24);
+      shake = 1.5 * U; SFX.hurt();
+      if (lives <= 0) { endGame('lives'); return; }
+    }
+  }
+  if (timeLeft <= 0) { timeLeft = 0; endGame('timeout'); }
+}
+
+function updateFx(dt) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const p = parts[i]; p.vy += 70 * U * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.life -= dt * 1.4;
+    if (p.life <= 0) parts.splice(i, 1);
+  }
+  for (let i = pops.length - 1; i >= 0; i--) { const p = pops[i]; p.y -= 8 * U * dt; p.life -= dt; if (p.life <= 0) pops.splice(i, 1); }
+  for (let i = ripples.length - 1; i >= 0; i--) { ripples[i].life -= dt * 2.5; if (ripples[i].life <= 0) ripples.splice(i, 1); }
+  for (const m of monsters) if (m.flash > 0) m.flash -= dt;
+  for (let i = rescued.length - 1; i >= 0; i--) { const q = rescued[i]; q.vy += 60 * U * dt; q.x += q.vx * dt; q.y += q.vy * dt;
+    q.spin += dt * 8; q.life -= dt * 1.1; if (q.life <= 0) rescued.splice(i, 1); }
+  if (boss) {
+    if (boss.flash > 0) boss.flash -= dt;
+    if (boss.flee) { boss.y -= 30 * U * dt; if (boss.y < -40 * U) boss = null; }
+    else if (boss.hp <= 0) boss = null;
+  }
+  shake *= Math.pow(.02, dt);
+}
+
+function updateDecor(dt) {
+  while (decor.length < 6) decor.push({ x: Math.random() * W, y: Math.random() * H, vx: (Math.random() - .5) * 30 * U,
+    vy: (Math.random() - .5) * 30 * U, r: (6 + Math.random() * 6) * U, phase: Math.random() * 6, color: PAL[decor.length], type: 'normal',
+    eyes: 1 + decor.length % 3, variant: Math.floor(Math.random() * CONFIG.images.normal.length), flash: 0, dx: 0 });
+  for (const d of decor) {
+    d.x += d.vx * dt; d.y += d.vy * dt; d.phase += dt * 3;
+    if (d.x < d.r || d.x > W - d.r) d.vx *= -1;
+    if (d.y < d.r || d.y > H - d.r) d.vy *= -1;
+    d.x = Math.max(d.r, Math.min(W - d.r, d.x)); d.y = Math.max(d.r, Math.min(H - d.r, d.y));
+  }
+}
+
+/* ---------- KRESLENÍ ---------- */
+function text(str, x, y, size, color = '#fff', align = 'center') {
+  ctx.font = `700 ${size}px Fredoka, "Arial Rounded MT Bold", Arial, sans-serif`;
+  ctx.textAlign = align; ctx.textBaseline = 'middle'; ctx.lineJoin = 'round';
+  ctx.lineWidth = size * .16; ctx.strokeStyle = 'rgba(30,0,60,.75)'; ctx.strokeText(str, x, y);
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+
+function drawBackground() {
+  if (IMG.bg) {
+    const s = Math.max(W / IMG.bg.width, H / IMG.bg.height);
+    ctx.drawImage(IMG.bg, (W - IMG.bg.width * s) / 2, (H - IMG.bg.height * s) / 2, IMG.bg.width * s, IMG.bg.height * s);
+    // lehké ztmavení, aby příšerky na pestrém pozadí vynikly
+    ctx.fillStyle = state === 'play' || state === 'countdown' ? 'rgba(10,20,60,.28)' : 'rgba(10,20,60,.15)';
+    ctx.fillRect(0, 0, W, H);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#2b1a6b'); g.addColorStop(.6, '#3a5bd9'); g.addColorStop(1, '#5ec8f2');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = 'rgba(255,255,255,.07)';
+    for (let i = 0; i < 14; i++) { ctx.beginPath(); ctx.arc((i * 173) % W, (i * 97) % (H * .7), (4 + i % 5 * 3) * U, 0, 7); ctx.fill(); }
+  }
+  if (state === 'play' || state === 'countdown') {     // nebezpečná zóna dole
+    const g = ctx.createLinearGradient(0, H - 8 * U, 0, H);
+    g.addColorStop(0, 'rgba(255,40,80,0)'); g.addColorStop(1, 'rgba(255,40,80,.55)');
+    ctx.fillStyle = g; ctx.fillRect(0, H - 8 * U, W, 8 * U);
+    ctx.setLineDash([3 * U, 2 * U]); ctx.strokeStyle = 'rgba(255,90,120,.9)'; ctx.lineWidth = .6 * U;
+    ctx.beginPath(); ctx.moveTo(0, H - 3 * U); ctx.lineTo(W, H - 3 * U); ctx.stroke(); ctx.setLineDash([]);
+  }
+}
+
+function drawMonster(m, x, y, r) {
+  const img = IMG[(m.type || 'normal') + m.variant];
+  ctx.save(); ctx.translate(x, y);
+  const s = 1 + Math.sin(m.phase * 2) * .06; ctx.scale(1 / s, s);
+  if (img) {
+    const k = r * 2.5 / Math.max(img.width, img.height);
+    ctx.shadowColor = 'rgba(255,255,255,.95)'; ctx.shadowBlur = 2.2 * U;   // záře – odliší od postaviček v pozadí
+    ctx.drawImage(img, -img.width * k / 2, -img.height * k / 2, img.width * k, img.height * k);
+  } else {
+    const c = m.color;
+    ctx.fillStyle = c; ctx.strokeStyle = c; ctx.lineWidth = r * .12; ctx.lineCap = 'round';
+    for (const k of [-1, 1]) {                       // tykadla
+      ctx.beginPath(); ctx.moveTo(k * r * .35, -r * .8); ctx.lineTo(k * r * .6, -r * 1.25); ctx.stroke();
+      ctx.beginPath(); ctx.arc(k * r * .6, -r * 1.25, r * .15, 0, 7); ctx.fill();
+    }
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.25)'; ctx.beginPath(); ctx.ellipse(0, r * .4, r * .6, r * .4, 0, 0, 7); ctx.fill();
+    const eyes = m.eyes, er = eyes === 1 ? r * .38 : r * .26;
+    for (let i = 0; i < eyes; i++) {
+      const ex = eyes === 1 ? 0 : (i - (eyes - 1) / 2) * r * (eyes === 3 ? .55 : .7);
+      const ey = -r * .2 - (eyes === 3 && i === 1 ? r * .15 : 0);
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(ex, ey, er, 0, 7); ctx.fill();
+      ctx.fillStyle = '#1a1033'; ctx.beginPath(); ctx.arc(ex, ey + er * .3, er * .5, 0, 7); ctx.fill();
+    }
+    ctx.fillStyle = '#1a1033'; ctx.beginPath(); ctx.arc(0, r * .3, r * .35, 0, Math.PI); ctx.fill();
+    ctx.fillStyle = '#fff';
+    for (const k of [-1, 1]) { ctx.beginPath(); ctx.moveTo(k * r * .22, r * .3); ctx.lineTo(k * r * .1, r * .3); ctx.lineTo(k * r * .16, r * .45); ctx.fill(); }
+  }
+  if (m.flash > 0) { ctx.fillStyle = 'rgba(255,255,255,.7)'; ctx.beginPath(); ctx.arc(0, 0, r * 1.05, 0, 7); ctx.fill(); }
+  ctx.restore();
+  if (m.maxHp > 1) for (let i = 0; i < m.maxHp; i++) {   // životy velké příšerky
+    ctx.fillStyle = i < m.hp ? '#ffe14d' : 'rgba(255,255,255,.3)';
+    ctx.beginPath(); ctx.arc(x + (i - (m.maxHp - 1) / 2) * 3 * U, y - r * 1.55, 1.1 * U, 0, 7); ctx.fill();
+  }
+}
+
+function drawBoss() {
+  const b = boss, r = b.r;
+  ctx.save(); ctx.translate(b.x, b.y);
+  const s = 1 + Math.sin(performance.now() / 200) * .04; ctx.scale(s, 1 / s);
+  if (IMG.boss) { const k = r * 2.6 / Math.max(IMG.boss.width, IMG.boss.height);
+    ctx.shadowColor = 'rgba(255,60,60,.9)'; ctx.shadowBlur = 4 * U;
+    ctx.drawImage(IMG.boss, -IMG.boss.width * k / 2, -IMG.boss.height * k / 2, IMG.boss.width * k, IMG.boss.height * k); }
+  else {
+    ctx.fillStyle = '#7b2ff7';
+    for (const k of [-1, 1]) { ctx.beginPath(); ctx.moveTo(k * r * .4, -r * .7); ctx.lineTo(k * r * .95, -r * 1.3); ctx.lineTo(k * r * .8, -r * .45); ctx.fill(); }
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.beginPath(); ctx.ellipse(0, r * .45, r * .65, r * .4, 0, 0, 7); ctx.fill();
+    for (const k of [-1, 1]) {
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(k * r * .35, -r * .15, r * .22, 0, 7); ctx.fill();
+      ctx.fillStyle = '#e0002a'; ctx.beginPath(); ctx.arc(k * r * .35, -r * .08, r * .11, 0, 7); ctx.fill();
+      ctx.strokeStyle = '#1a1033'; ctx.lineWidth = r * .08; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(k * r * .6, -r * .5); ctx.lineTo(k * r * .15, -r * .35); ctx.stroke();
+    }
+    ctx.fillStyle = '#1a1033'; ctx.beginPath(); ctx.ellipse(0, r * .42, r * .45, r * .2, 0, 0, 7); ctx.fill();
+    ctx.fillStyle = '#fff';
+    for (let i = -2; i <= 2; i++) { ctx.beginPath(); ctx.moveTo(i * r * .16 - r * .06, r * .26); ctx.lineTo(i * r * .16 + r * .06, r * .26); ctx.lineTo(i * r * .16, r * .4); ctx.fill(); }
+  }
+  if (b.flash > 0) { ctx.fillStyle = 'rgba(255,255,255,.6)'; ctx.beginPath(); ctx.arc(0, 0, r, 0, 7); ctx.fill(); }
+  ctx.restore();
+}
+
+function heart(x, y, s, color) {
+  ctx.fillStyle = color; ctx.beginPath();
+  ctx.moveTo(x, y + s * .35);
+  ctx.bezierCurveTo(x - s * .9, y - s * .3, x - s * .4, y - s * .9, x, y - s * .35);
+  ctx.bezierCurveTo(x + s * .4, y - s * .9, x + s * .9, y - s * .3, x, y + s * .35);
+  ctx.fill();
+}
+
+function drawHUD() {
+  for (let i = 0; i < CONFIG.lives; i++) heart(4 * U + i * 5 * U, 5 * U, 4 * U, i < lives ? '#ff3d6e' : 'rgba(255,255,255,.25)');
+  text('Skóre: ' + score, W - 3 * U, 5 * U, 5.5 * U, '#ffe14d', 'right');
+  const bw = W * .3, bx = (W - bw) / 2, frac = timeLeft / CONFIG.roundSeconds;
+  ctx.fillStyle = 'rgba(0,0,0,.35)'; ctx.fillRect(bx, 3 * U, bw, 3.5 * U);
+  ctx.fillStyle = timeLeft < 15 ? '#ff3d6e' : '#3ddc84'; ctx.fillRect(bx, 3 * U, bw * frac, 3.5 * U);
+  text(Math.ceil(timeLeft) + ' s', W / 2, 4.8 * U, 3.5 * U);
+  if (boss && !boss.flee) {
+    const w = W * .5, x = (W - w) / 2, y = 10 * U;
+    ctx.fillStyle = 'rgba(0,0,0,.45)'; ctx.fillRect(x, y, w, 3 * U);
+    ctx.fillStyle = '#b388ff'; ctx.fillRect(x, y, w * boss.hp / boss.maxHp, 3 * U);
+    text('PIRÁT', x - 2 * U, y + 1.5 * U, 3.5 * U, '#b388ff', 'right');
+  }
+}
+
+function drawFx() {
+  for (const p of parts) { ctx.globalAlpha = Math.max(0, p.life); ctx.fillStyle = p.color; ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, 7); ctx.fill(); }
+  ctx.globalAlpha = 1;
+  for (const r of ripples) {
+    ctx.strokeStyle = `rgba(255,255,255,${r.life * .8})`; ctx.lineWidth = .7 * U;
+    ctx.beginPath(); ctx.arc(r.x, r.y, (1 - r.life) * 7 * U + U, 0, 7); ctx.stroke();
+  }
+  for (const p of pops) { ctx.globalAlpha = Math.min(1, p.life * 2); text(p.text, p.x, p.y, p.size, p.color); }
+  ctx.globalAlpha = 1;
+}
+
+function drawLogo() { if (IMG.logo) { const h = 12 * U, w = h * IMG.logo.width / IMG.logo.height; ctx.drawImage(IMG.logo, 3 * U, H - h - 3 * U, w, h); } }
+
+function render(t) {
+  ctx.save();
+  if (shake > .1) ctx.translate((Math.random() - .5) * shake * 2, (Math.random() - .5) * shake * 2);
+  drawBackground();
+
+  if (state === 'attract') {
+    for (const d of decor) drawMonster(d, d.x, d.y, d.r);
+    drawLogo();
+    text('ZACHRAŇTE HOPSÁKY!', W / 2, 28 * U, 14 * U, '#ffe14d');
+    text('Hopsáci padají do moře – chyťte je dřív, než šplouchnou!', W / 2, 44 * U, 5.5 * U);
+    const pulse = 1 + Math.sin(t / 250) * .06;
+    text('Dotkni se stěny nebo hoď míček!', W / 2, 64 * U, 7 * U * pulse, '#7df9ff');
+    if (best > 0) text('Dnešní rekord: ' + best, W / 2, 82 * U, 4.5 * U, '#ffb627');
+  } else {
+    for (const m of monsters) drawMonster(m, m.x + m.dx, m.y, m.r);
+    for (const q of rescued) { ctx.save(); ctx.globalAlpha = Math.max(0, q.life); ctx.translate(q.x, q.y); ctx.rotate(q.spin);
+      drawMonster(q, 0, 0, q.r * (1 + (1 - q.life) * .3)); ctx.restore(); }
+    if (boss) drawBoss();
+    if (state !== 'end') drawHUD();
+  }
+
+  if (state === 'countdown') {
+    const n = 3 - Math.floor(stateT);
+    text('Chytejte Hopsáky, než spadnou do moře!', W / 2, 30 * U, 6 * U);
+    text(n > 0 ? String(n) : 'START!', W / 2, 58 * U, 22 * U * (1.3 - (stateT % 1) * .3), '#ffe14d');
+  }
+
+  if (state === 'end') {
+    ctx.fillStyle = 'rgba(20,0,50,.45)'; ctx.fillRect(0, 0, W, H);
+    const title = result === 'win' ? 'VYHRÁLI JSTE!' : result === 'lives' ? 'Moc Hopsáků spadlo do moře!' : 'Pirát utekl!';
+    text(title, W / 2, 20 * U, 12 * U, result === 'win' ? '#ffe14d' : '#ff7b9c');
+    text('Společné skóre: ' + score, W / 2, 38 * U, 9 * U);
+    if (lastBonus) text('včetně bonusu za piráta +' + lastBonus, W / 2, 50 * U, 4.5 * U, '#ffe14d');
+    if (newRecord) text('★ Nový rekord dne! ★', W / 2, 62 * U, 6 * U * (1 + Math.sin(t / 200) * .05), '#7df9ff');
+    else text('Dnešní rekord: ' + best, W / 2, 62 * U, 5 * U, '#ffb627');
+    if (stateT > 4) text('Zásahem do stěny začnete znovu', W / 2, 78 * U, 5 * U * (1 + Math.sin(t / 250) * .05));
+    drawLogo();
+  }
+
+  drawFx();
+  if (debug) text(`${Math.round(W)}×${Math.round(H)}  příšerek: ${monsters.length}  stav: ${state}`, 2 * U, H - 3 * U, 2.5 * U, '#fff', 'left');
+  ctx.restore();
+}
+
+/* ---------- SMYČKA ---------- */
+let last = performance.now();
+function loop(t) {
+  const dt = Math.min(.05, (t - last) / 1000); last = t;
+  stateT += dt;
+  if (state === 'attract') updateDecor(dt);
+  if (state === 'countdown' && stateT >= 3.6) setState('play');
+  if (state === 'play') updatePlay(dt);
+  if (state === 'end' && stateT > CONFIG.endScreenSeconds) { boss = null; setState('attract'); }
+  updateFx(dt);
+  render(t);
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+/* ---------- VSTUP (multitouch přes Pointer Events) ---------- */
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault(); audioInit();
+  const r = cv.getBoundingClientRect();
+  onHit(e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+['contextmenu', 'touchstart', 'touchmove', 'gesturestart', 'dblclick'].forEach(ev =>
+  document.addEventListener(ev, e => e.preventDefault(), { passive: false }));
+addEventListener('keydown', e => {
+  if (e.key === 'f' || e.key === 'F') { if (!document.fullscreenElement) document.documentElement.requestFullscreen?.(); else document.exitFullscreen?.(); }
+  if (e.key === 'd' || e.key === 'D') debug = !debug;
+});
+</script>
+</body>
+</html>
